@@ -1128,9 +1128,10 @@ class BSController:
     def force_push_functions(self, func_addrs: List[int], use_decompilation=False):
         """
         Collects the functions currently stored in the decompiler, not the BS State, and commits it to
-        the master users BS Database. Function addrs should be in the lifted form.
+        the master users BS Database. Function addrs should be in the lifted form. Comments that fall
+        within each pushed function are collected from the decompiler and committed as well.
 
-        TODO: push the comments and custom types that are associated with each stack vars
+        TODO: push the custom types that are associated with each stack var
         TODO: refactor to use internal push_function for correct commit message
         """
 
@@ -1164,10 +1165,53 @@ class BSController:
             master_state.set_function(func)
         committed += len(funcs)
 
+        # also force push the comments contained within each pushed function. comments are a
+        # separate, address-keyed artifact rather than fields on the Function, so they are not
+        # carried by set_function and must be collected and committed explicitly.
+        cmt_committed = self._force_push_function_comments(master_state, funcs)
+
         # commit the master state back!
-        master_state.last_commit_msg = f"Force pushed {committed} functions"
+        cmt_suffix = f" and {cmt_committed} comment{'' if cmt_committed == 1 else 's'}" if cmt_committed else ""
+        master_state.last_commit_msg = f"Force pushed {committed} functions{cmt_suffix}"
         self.client.master_state = master_state
-        self.deci.info(f"Functions force push successful: committed {committed} function{'' if committed == 1 else 's'}.")
+        self.deci.info(
+            f"Functions force push successful: committed {committed} function{'' if committed == 1 else 's'}"
+            f"{cmt_suffix}."
+        )
+
+    def _force_push_function_comments(self, master_state: State, funcs: List[Function]) -> int:
+        """
+        Collects every comment currently set in the decompiler that falls within one of the given
+        functions and commits it into ``master_state``. The decompiler is scanned exactly once
+        regardless of how many functions are pushed. Comments are attributed to a function by
+        address range, matching ``State.get_func_comments``, so this works against any declib that
+        exposes ``deci.comments`` (it does not rely on the comment's ``func_addr`` being populated).
+        Returns the number of comments committed.
+        """
+        try:
+            decompiler_comments = dict(self.deci.comments.items())
+        except Exception as e:
+            _l.warning("Failed to collect decompiler comments for force push: %s", e)
+            return 0
+
+        if not decompiler_comments:
+            return 0
+
+        committed = 0
+        for func in funcs:
+            func_size = func.size or self.deci.get_func_size(func.addr) or 0
+            func_end = func.addr + func_size
+            for addr, cmt in decompiler_comments.items():
+                if cmt is None or not cmt.comment:
+                    continue
+                if not (func.addr <= addr <= func_end):
+                    continue
+
+                cmt.func_addr = func.addr
+                if master_state.set_comment(cmt):
+                    committed += 1
+
+        return committed
 
     @init_checker
     def force_push_global_vars(self, addrs: List[int]):
