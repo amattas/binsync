@@ -1,5 +1,3 @@
-from collections import defaultdict
-
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
     QVBoxLayout
@@ -25,8 +23,10 @@ from binsync.ui.config_dialog import ConfigureBSDialog
 class BinSyncSidebarWidget(SidebarWidget):
     def __init__(self, bv, bs_interface, name="BinSync"):
         super().__init__(name)
-        self._controller = bs_interface.controllers[bv]
-        self._controller.bv = bv
+        self._controller = bs_interface.controller_for_bv(bv)
+        if self._controller is None:
+            raise ValueError("A BinaryView is required to create the BinSync sidebar")
+
         self._widget = ControlPanel(self._controller)
 
         layout = QVBoxLayout()
@@ -61,9 +61,31 @@ class BinjaBSInterface(BinjaInterface):
     """
 
     def __init__(self, *args, **kwargs):
-        self.controllers = defaultdict(BSController)
+        self.controllers = {}
         self.sidebar_widget_type = None
         super().__init__(*args, **kwargs)
+
+    def controller_for_bv(self, bv):
+        if bv is None:
+            return None
+
+        try:
+            return self.controllers[bv]
+        except KeyError:
+            pass
+
+        deci = BinjaInterface(bv=bv)
+        controller = BSController(decompiler_interface=deci)
+        self.controllers[bv] = controller
+        return controller
+
+    def stop_controllers(self):
+        for controller in list(self.controllers.values()):
+            try:
+                controller.stop_worker_routines()
+            except Exception:
+                pass
+        self.controllers.clear()
 
     def _init_gui_components(self, *args, **kwargs):
         if super()._init_gui_components(*args, **kwargs):
@@ -80,8 +102,14 @@ class BinjaBSInterface(BinjaInterface):
             Sidebar.addSidebarWidgetType(self.sidebar_widget_type)
 
     def _launch_bs_config(self, bn_context):
-        bv = bn_context.context.getCurrentView().getData()
-        bs_controller = self.controllers[bv]
+        view = bn_context.context.getCurrentView()
+        if view is None:
+            return
+
+        bv = view.getData()
+        bs_controller = self.controller_for_bv(bv)
+        if bs_controller is None:
+            return
 
         # exit early if we already configured
         if (bs_controller.check_client() and bs_controller.deci.bv is not None) or bv is None:
@@ -89,7 +117,6 @@ class BinjaBSInterface(BinjaInterface):
 
         # configure
         self.bv = bv
-        bs_controller.deci.bv = bv
         dialog = ConfigureBSDialog(bs_controller)
         dialog.exec_()
 
