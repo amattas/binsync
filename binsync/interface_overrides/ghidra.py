@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 import atexit
 from time import sleep
@@ -15,6 +16,7 @@ from binsync.ui.config_dialog import ConfigureBSDialog
 from binsync.controller import BSController
 
 _l = logging.getLogger(__name__)
+BINSYNC_GHIDRA_SERVER_URL = "BINSYNC_GHIDRA_SERVER_URL"
 
 
 class ControlPanelWindow(QMainWindow):
@@ -55,7 +57,8 @@ class ControlPanelWindow(QMainWindow):
 
 def start_ghidra_ui():
     from declib.api.decompiler_client import DecompilerClient
-    deci = DecompilerClient.discover()
+    server_url = os.environ.get(BINSYNC_GHIDRA_SERVER_URL)
+    deci = DecompilerClient.discover(server_url=server_url) if server_url else DecompilerClient.discover()
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
@@ -87,11 +90,11 @@ class GhidraRemoteInterfaceWrapper:
         self.server.start()
         sleep(1)
         _l.info("Server started on socket: %s", self.server.socket_path)
-        self.gui_process = self.start_gui_in_new_process()
+        self.gui_process = self.start_gui_in_new_process(socket_path=self.server.socket_path)
         atexit.register(self.shutdown)
 
     @staticmethod
-    def start_gui_in_new_process():
+    def start_gui_in_new_process(socket_path=None):
         _l.info("Starting the Ghidra BinSync UI in a new process...")
         # Try command sets in order of preference.
         # We prefer sys.executable to ensure the current Python environment is used.
@@ -102,13 +105,18 @@ class GhidraRemoteInterfaceWrapper:
         ]
 
         proc = None
+        env = os.environ.copy()
+        if socket_path:
+            env[BINSYNC_GHIDRA_SERVER_URL] = f"unix://{socket_path}"
+
         for cmd in commands:
             _l.info(f"Attempting to start UI with command: {' '.join(cmd)}")
             try:
                 proc = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
                     text=True
                 )
                 sleep(1)
@@ -119,7 +127,7 @@ class GhidraRemoteInterfaceWrapper:
                     _l.info(f"Successfully started UI process with PID {proc.pid}")
                     break
                 else:
-                    _l.warning(f"Process exited prematurely: {proc.stderr.read()}")
+                    _l.warning("Process exited prematurely.")
             except Exception as e:
                 _l.warning(f"Failed to run command '{cmd[0]}': {e}")
                 
@@ -128,8 +136,7 @@ class GhidraRemoteInterfaceWrapper:
         
         # Check if the process exited prematurely (if the loop finished without breaking)
         if proc.poll() is not None:
-             error_output = proc.stderr.read() if proc.stderr else "Unknown error"
-             raise RuntimeError(f"Exhausted all methods to start the Ghidra BinSync UI. Last error: {error_output}")
+             raise RuntimeError("Exhausted all methods to start the Ghidra BinSync UI.")
              
         _l.info("Ghidra BinSync UI process started with PID %d", proc.pid)
         return proc
