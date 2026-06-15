@@ -245,7 +245,7 @@ class QUtilPanel(QWidget):
 
     def _handle_progress_view(self):
         from ..progress_graph.progress_window import ProgressGraphWidget
-        dialog = ProgressGraphWidget(graph=self.controller.deci.get_callgraph(), controller=self.controller, parent=self)
+        dialog = ProgressGraphWidget(graph=self.controller.get_progress_callgraph(), controller=self.controller, parent=self)
         dialog.exec_()
 
     #
