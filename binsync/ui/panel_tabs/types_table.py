@@ -186,8 +186,8 @@ class TypesTableView(BinsyncTableView):
                 menu.popup(self.mapToGlobal(event.pos()))
                 return
 
-            filler_func = lambda username: lambda chk=False: self.controller.fill_artifact(
-                type_name, artifact_type=artifact_cls, user=username
+            filler_func = lambda username: lambda checked=False, name=type_name, cls=artifact_cls, user=username: self.controller.schedule_job(
+                self.controller.fill_artifact, name, artifact_type=cls, user=user
             )
 
             menu.addSeparator()

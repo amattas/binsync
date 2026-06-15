@@ -159,7 +159,10 @@ class FunctionTableView(BinsyncTableView):
             menu.addSeparator()
             if isinstance(func_addr, int) and func_addr > 0:
                 sync_action = QAction("Sync", parent=menu)
-                sync_action.triggered.connect( lambda: self.controller.fill_artifact(func_addr, artifact_type=Function, user=user_name))
+                sync_action.triggered.connect(
+                    lambda checked=False, addr=func_addr, name=user_name: self.controller.schedule_job(
+                        self.controller.fill_artifact, addr, artifact_type=Function, user=name)
+                )
                 menu.addAction(sync_action)
                 sync_action.hovered.connect(lambda act=sync_action: self.show_tooltip(func_addr, user_name, action=act))
 
@@ -168,7 +171,9 @@ class FunctionTableView(BinsyncTableView):
             for username in users:
                 action = from_menu.addAction(username)
                 action.triggered.connect(
-                    lambda checked=False, name=username: self.controller.fill_artifact(func_addr, artifact_type=Function, user=name))
+                    lambda checked=False, addr=func_addr, name=username: self.controller.schedule_job(
+                        self.controller.fill_artifact, addr, artifact_type=Function, user=name)
+                )
                 action.hovered.connect(
                     lambda name=username, act=action: self.show_tooltip(func_addr, name, action=act))
         menu.popup(self.mapToGlobal(event.pos()))
