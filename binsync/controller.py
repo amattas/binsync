@@ -1610,6 +1610,50 @@ class BSController:
 
         return function_counts
 
+    def get_progress_callgraph(self):
+        import networkx as nx
+
+        fallback_to_xrefs = False
+        try:
+            graph = self.deci.get_callgraph()
+        except Exception as e:
+            _l.warning("Failed to collect decompiler callgraph for progress view: %s", e)
+            graph = nx.DiGraph()
+            fallback_to_xrefs = True
+            try:
+                self.deci.warning("Callgraph collection failed; rebuilding progress graph from code xrefs.")
+            except Exception:
+                pass
+        else:
+            graph = graph.copy() if graph is not None else nx.DiGraph()
+
+        funcs_by_addr = {
+            func.addr: func for func in self.deci.functions.values()
+            if getattr(func, "addr", None) is not None
+        }
+
+        # Some backend callgraph APIs only add functions that participate in an edge.
+        # The progress view still needs isolated and changed functions as nodes.
+        for func in funcs_by_addr.values():
+            graph.add_node(func)
+
+        if fallback_to_xrefs and hasattr(self.deci, "xrefs_to"):
+            for target_func in funcs_by_addr.values():
+                try:
+                    callers = self.deci.xrefs_to(target_func, only_code=True)
+                except Exception as e:
+                    _l.debug("Failed to collect code xrefs to %s for progress view: %s", target_func, e)
+                    continue
+
+                for caller in callers:
+                    if not isinstance(caller, Function):
+                        continue
+
+                    caller_func = funcs_by_addr.get(caller.addr, caller)
+                    graph.add_edge(caller_func, target_func)
+
+        return graph
+
     def show_progress_window(self, *args, tag=None, **kwargs):
         """
         TODO: re-enable this later when you figure out how fix the apparent thread/proccess issue in IDA Pro
@@ -1623,7 +1667,7 @@ class BSController:
         #    return
 
         self.deci.info("Collecting data to make progress view now...")
-        graph = self.deci.get_callgraph()
+        graph = self.get_progress_callgraph()
         if tag == "master":
             tag = None
 
