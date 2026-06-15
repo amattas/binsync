@@ -39,6 +39,7 @@ l = logging.getLogger(__name__)
 class QUtilPanel(QWidget):
     connected_to_server = Signal(bool)
     server_context_change = Signal(dict) # type is dict[str,dict[str,int]] but we get a TypeError: bytes or ASCII string expected not 'types.GenericAlias'
+    stop_client_worker = Signal()
     
     def __init__(self, controller: BSController, parent=None):
         super().__init__(parent)
@@ -219,6 +220,7 @@ class QUtilPanel(QWidget):
         self.client_worker.moveToThread(self.client_thread)
         self.client_worker.context_change.connect(lambda new_context: self.server_context_change.emit(new_context))
         self.client_worker.client_connected.connect(lambda connected: self.connected_to_server.emit(connected))
+        self.stop_client_worker.connect(self.client_worker.stop)
         
         self.client_worker.finished.connect(self.client_thread.quit)
         self.client_thread.start()
@@ -242,6 +244,38 @@ class QUtilPanel(QWidget):
 
         self._aux_server_dialog.startup_emits()
         self._aux_server_dialog.exec()
+
+    def shutdown(self):
+        worker = getattr(self, "client_worker", None)
+        thread = getattr(self, "client_thread", None)
+
+        if worker is not None:
+            try:
+                stop_signal = getattr(self, "stop_client_worker", None)
+                if stop_signal is not None:
+                    stop_signal.emit()
+                else:
+                    worker.stop()
+            except RuntimeError:
+                pass
+            except Exception as e:
+                l.warning("Failed to stop auxiliary server client worker: %s", e)
+
+        if thread is not None:
+            try:
+                if not hasattr(thread, "isRunning") or thread.isRunning():
+                    thread.wait(1000)
+
+                if not hasattr(thread, "isRunning") or thread.isRunning():
+                    thread.quit()
+                    thread.wait(1000)
+            except RuntimeError:
+                pass
+            except Exception as e:
+                l.warning("Failed to stop auxiliary server client thread: %s", e)
+
+        self.client_worker = None
+        self.client_thread = None
 
     def _handle_progress_view(self):
         from ..progress_graph.progress_window import ProgressGraphWidget
