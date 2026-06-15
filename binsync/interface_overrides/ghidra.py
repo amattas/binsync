@@ -2,6 +2,8 @@ import logging
 import os
 import sys
 import atexit
+import tempfile
+from pathlib import Path
 from time import sleep
 import subprocess
 
@@ -17,6 +19,12 @@ from binsync.controller import BSController
 
 _l = logging.getLogger(__name__)
 BINSYNC_GHIDRA_SERVER_URL = "BINSYNC_GHIDRA_SERVER_URL"
+BINSYNC_GHIDRA_UI_LOG_PATH = "BINSYNC_GHIDRA_UI_LOG_PATH"
+
+
+def _ghidra_ui_log_path():
+    configured_path = os.environ.get(BINSYNC_GHIDRA_UI_LOG_PATH)
+    return Path(configured_path) if configured_path else Path(tempfile.gettempdir()) / "binsync-ghidra-ui.log"
 
 
 class ControlPanelWindow(QMainWindow):
@@ -49,7 +57,18 @@ class ControlPanelWindow(QMainWindow):
         return self.controller.check_client()
 
     def closeEvent(self, event):
-        self.controller.shutdown()
+        try:
+            self.controller.stop_worker_routines()
+        except Exception:
+            _l.exception("Failed to stop BinSync worker routines before closing Ghidra UI")
+
+        try:
+            if hasattr(self._interface, "shutdown_server"):
+                self._interface.shutdown_server()
+            else:
+                self._interface.shutdown()
+        except Exception:
+            _l.exception("Failed to shut down Ghidra remote interface")
         # Brief delay to allow threads to finish cleanup
         # With the Scheduler timeout fix, threads should exit quickly
         QTimer.singleShot(200, QApplication.quit)
@@ -88,10 +107,12 @@ class GhidraRemoteInterfaceWrapper:
         self.gui_process = None
         self._shutdown_done = False
         self.server.start()
+        atexit.register(self.shutdown)
         sleep(1)
         _l.info("Server started on socket: %s", self.server.socket_path)
         self.gui_process = self.start_gui_in_new_process(socket_path=self.server.socket_path)
-        atexit.register(self.shutdown)
+        if getattr(self.server, "requires_main_thread", False):
+            self.server.wait_for_shutdown()
 
     @staticmethod
     def start_gui_in_new_process(socket_path=None):
@@ -108,14 +129,20 @@ class GhidraRemoteInterfaceWrapper:
         env = os.environ.copy()
         if socket_path:
             env[BINSYNC_GHIDRA_SERVER_URL] = f"unix://{socket_path}"
+        log_path = _ghidra_ui_log_path()
+        env[BINSYNC_GHIDRA_UI_LOG_PATH] = str(log_path)
 
         for cmd in commands:
             _l.info(f"Attempting to start UI with command: {' '.join(cmd)}")
+            log_file = None
             try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_file = log_path.open("a", buffering=1, encoding="utf-8")
+                log_file.write(f"\n--- Starting Ghidra BinSync UI: {' '.join(cmd)} ---\n")
                 proc = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=log_file,
                     env=env,
                     text=True
                 )
@@ -127,9 +154,15 @@ class GhidraRemoteInterfaceWrapper:
                     _l.info(f"Successfully started UI process with PID {proc.pid}")
                     break
                 else:
-                    _l.warning("Process exited prematurely.")
+                    _l.warning("Process exited prematurely; see Ghidra BinSync UI log: %s", log_path)
             except Exception as e:
                 _l.warning(f"Failed to run command '{cmd[0]}': {e}")
+            finally:
+                if log_file is not None:
+                    try:
+                        log_file.close()
+                    except Exception:
+                        pass
                 
         if proc is None:
              raise RuntimeError("Exhausted all methods to start the Ghidra BinSync UI.")
