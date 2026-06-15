@@ -1,6 +1,6 @@
 import logging
 import sys
-import threading
+import atexit
 from time import sleep
 import subprocess
 
@@ -82,12 +82,13 @@ class GhidraRemoteInterfaceWrapper:
     def __init__(self, *args, **kwargs):
         #import remote_pdb; remote_pdb.RemotePdb('localhost', 4444).set_trace()
         self.server = DecompilerServer(force_decompiler="ghidra")
-        #self.server.start()
-        self.server_thread = threading.Thread(target=self.server.start, daemon=True)
-        self.server_thread.run()
+        self.gui_process = None
+        self._shutdown_done = False
+        self.server.start()
         sleep(1)
         _l.info("Server started on socket: %s", self.server.socket_path)
-        self.start_gui_in_new_process()
+        self.gui_process = self.start_gui_in_new_process()
+        atexit.register(self.shutdown)
 
     @staticmethod
     def start_gui_in_new_process():
@@ -131,6 +132,35 @@ class GhidraRemoteInterfaceWrapper:
              raise RuntimeError(f"Exhausted all methods to start the Ghidra BinSync UI. Last error: {error_output}")
              
         _l.info("Ghidra BinSync UI process started with PID %d", proc.pid)
+        return proc
+
+    def shutdown(self):
+        if getattr(self, "_shutdown_done", False):
+            return
+
+        self._shutdown_done = True
+        proc = getattr(self, "gui_process", None)
+        if proc is not None and proc.poll() is None:
+            _l.info("Terminating Ghidra BinSync UI process with PID %d", proc.pid)
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                _l.warning("Ghidra BinSync UI process did not exit after terminate; killing it.")
+                proc.kill()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    _l.warning("Ghidra BinSync UI process did not exit after kill.")
+            except Exception as e:
+                _l.warning("Failed to terminate Ghidra BinSync UI process: %s", e)
+
+        server = getattr(self, "server", None)
+        if server is not None:
+            try:
+                server.stop()
+            except Exception as e:
+                _l.warning("Failed to stop Ghidra BinSync server: %s", e)
 
     @property
     def gui_plugin(self):
