@@ -212,15 +212,22 @@ class ActivityTableView(BinsyncTableView):
             user_name = self.model.row_data[idx.row()][ActivityTableModel.USERNAME_COL]
 
             menu.addSeparator()
+            # NOTE: dispatch the fills on the controller's worker thread (schedule_job)
+            # instead of calling fill_artifact/sync_all directly. Running them inline
+            # here executes the entire sync (RPCs, per-comment git commits) on the Qt
+            # GUI thread, which freezes/deadlocks the UI for the duration.
             if isinstance(func_addr, int) and func_addr > 0:
-                menu.addAction("Sync", lambda: self.controller.fill_artifact(func_addr, artifact_type=Function, user=user_name))
-            menu.addAction("Sync-All", lambda: self.controller.sync_all(user=user_name))
+                menu.addAction("Sync", lambda checked=False, addr=func_addr, name=user_name: self.controller.schedule_job(
+                    self.controller.fill_artifact, addr, artifact_type=Function, user=name))
+            menu.addAction("Sync-All", lambda checked=False, name=user_name: self.controller.schedule_job(
+                self.controller.sync_all, user=name))
 
             for_menu = menu.addMenu(f"Sync from {user_name} for...")
             for func_addr_str in self._get_valid_funcs_for_user(user_name):
                 action = for_menu.addAction(func_addr_str)
                 action.triggered.connect(
-                    lambda chk, func=func_addr_str: self.controller.fill_artifact(func_addr, artifact_type=Function, user=user_name))
+                    lambda checked=False, addr=int(func_addr_str, 16), name=user_name: self.controller.schedule_job(
+                        self.controller.fill_artifact, addr, artifact_type=Function, user=name))
 
         menu.popup(self.mapToGlobal(event.pos()))
         

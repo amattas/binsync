@@ -277,9 +277,6 @@ class BSController:
             self._ui_updater_thread.wait(2000)
 
     def schedule_job(self, cmd_func, *args, blocking=False, **kwargs):
-        if not self._auto_commit_enabled:
-            return None
-
         if blocking:
             return self.push_job_scheduler.schedule_and_wait_job(
                 Job(cmd_func, *args, **kwargs),
@@ -723,8 +720,15 @@ class BSController:
                             merged_artifact.header.args = {}
                             merged_artifact.header.type = None
 
-                # set the imports into the decompiler
-                art_dict[identifier] = merged_artifact
+                # set the imports into the decompiler. NOTE: a no-op set (e.g. the
+                # function already has this name/header in the decompiler) makes the
+                # underlying set_artifact return False, which the remote client turns
+                # into a "Failed to set artifact" exception. That must not abort the
+                # address-keyed comment sync below, so isolate the function set.
+                try:
+                    art_dict[identifier] = merged_artifact
+                except Exception as e:
+                    _l.warning("Setting %s into the decompiler made no change or failed: %s", merged_artifact, e)
 
                 # TODO: figure out a way to do this inside DecLib (getting all comments for a func)
                 if artifact_type is Function:
@@ -1124,6 +1128,9 @@ class BSController:
     # Force Push
     #
 
+    def _flush_force_push_state(self):
+        self.client.commit_and_update_states()
+
     @init_checker
     def force_push_functions(self, func_addrs: List[int], use_decompilation=False):
         """
@@ -1174,6 +1181,7 @@ class BSController:
         cmt_suffix = f" and {cmt_committed} comment{'' if cmt_committed == 1 else 's'}" if cmt_committed else ""
         master_state.last_commit_msg = f"Force pushed {committed} functions{cmt_suffix}"
         self.client.master_state = master_state
+        self._flush_force_push_state()
         self.deci.info(
             f"Functions force push successful: committed {committed} function{'' if committed == 1 else 's'}"
             f"{cmt_suffix}."
@@ -1202,6 +1210,12 @@ class BSController:
             func_size = func.size or self.deci.get_func_size(func.addr) or 0
             func_end = func.addr + func_size
             for addr, cmt in decompiler_comments.items():
+                # libbs may hand back either a Comment artifact or a raw comment
+                # string depending on how the comment was set in the decompiler
+                # (e.g. programmatic/MCP edits arrive as plain strings); normalize
+                # to a Comment so the attribute access below is always valid.
+                if isinstance(cmt, str):
+                    cmt = Comment(addr=addr, comment=cmt)
                 if cmt is None or not cmt.comment:
                     continue
                 if not (func.addr <= addr <= func_end):
@@ -1235,6 +1249,7 @@ class BSController:
 
         master_state.last_commit_msg = f"Force pushed {committed} global{'' if committed == 1 else 's'}"
         self.client.master_state = master_state
+        self._flush_force_push_state()
         self.deci.info(f"Globals force push successful: committed {committed} global{'' if committed == 1 else 's'}.")
 
     @init_checker
@@ -1262,6 +1277,7 @@ class BSController:
 
         master_state.last_commit_msg = f"Force pushed {committed} type{'' if committed == 1 else 's'}"
         self.client.master_state = master_state
+        self._flush_force_push_state()
         self.deci.info(f"Types force push successful: committed {committed} type{'' if committed == 1 else 's'}.")
 
     @init_checker
@@ -1293,6 +1309,7 @@ class BSController:
 
         master_state.last_commit_msg = f"Force pushed {committed} segments"
         self.client.master_state = master_state
+        self._flush_force_push_state()
         self.deci.info(f"Segments force push successful: committed {committed} segment{'' if committed == 1 else 's'}.")
 
     #
