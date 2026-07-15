@@ -1,9 +1,14 @@
 import sys
+from types import SimpleNamespace
+
+import pytest
 
 from binsync.extras.aux_server.aux_server import Server
 from binsync.extras.aux_server.store import ServerStore
 
 from binsync.ui.aux_server_panel.aux_server_window import ClientWorker
+from binsync.ui.control_panel import ControlPanel
+from binsync.ui.panel_tabs.util_panel import QUtilPanel
 from declib.ui.qt_objects import (
     QThread,
     QWidget,
@@ -371,5 +376,142 @@ class TestAuxServer(unittest.TestCase):
             ServerStore.DEFAULT_GROUPNAME: {}
         }
             
+
+
+class LifecycleFakeUtilitiesPanel:
+    def __init__(self):
+        self.shutdown_called = False
+
+    def shutdown(self):
+        self.shutdown_called = True
+
+
+class LifecycleFakeControlPanel:
+    def __init__(self, controller, utilities_panel):
+        self.controller = controller
+        self._utilities_panel = utilities_panel
+
+    def update_callback(self, *_args, **_kwargs):
+        pass
+
+    def ctx_callback(self, *_args, **_kwargs):
+        pass
+
+
+class LifecycleFakeWorker:
+    def __init__(self):
+        self.stop_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+class LifecycleFakeSignal:
+    def __init__(self, callback):
+        self.callback = callback
+        self.emit_calls = 0
+
+    def emit(self):
+        self.emit_calls += 1
+        self.callback()
+
+
+class LifecycleFakeThread:
+    def __init__(self, *, running, stops_on_first_wait):
+        self._running = running
+        self.stops_on_first_wait = stops_on_first_wait
+        self.wait_calls = []
+        self.quit_calls = 0
+
+    def isRunning(self):
+        return self._running
+
+    def quit(self):
+        self.quit_calls += 1
+        self._running = False
+
+    def wait(self, timeout):
+        self.wait_calls.append(timeout)
+        if self.stops_on_first_wait and len(self.wait_calls) == 1:
+            self._running = False
+
+
+class TestUiLifecycle:
+    @pytest.mark.parametrize(
+        "callbacks_are_owned",
+        [
+            pytest.param(True, id="owned"),
+            pytest.param(False, id="foreign"),
+        ],
+    )
+    def test_control_panel_close_preserves_callback_ownership(self, callbacks_are_owned):
+        controller = SimpleNamespace()
+        utilities_panel = LifecycleFakeUtilitiesPanel()
+        panel = LifecycleFakeControlPanel(controller, utilities_panel)
+        foreign_ui_callback = object()
+        foreign_ctx_callback = object()
+        controller.ui_callback = panel.update_callback if callbacks_are_owned else foreign_ui_callback
+        controller.ctx_change_callback = panel.ctx_callback if callbacks_are_owned else foreign_ctx_callback
+        controller.client_init_callback = object()
+        if callbacks_are_owned:
+            assert controller.ui_callback == panel.update_callback
+            assert controller.ui_callback is not panel.update_callback
+            assert controller.ctx_change_callback == panel.ctx_callback
+            assert controller.ctx_change_callback is not panel.ctx_callback
+
+        ControlPanel.closeEvent(panel, object())
+
+        assert utilities_panel.shutdown_called is True
+        assert controller.ui_callback is (None if callbacks_are_owned else foreign_ui_callback)
+        assert controller.ctx_change_callback is (None if callbacks_are_owned else foreign_ctx_callback)
+        assert controller.client_init_callback is None
+
+    @pytest.mark.parametrize(
+        (
+            "thread_running",
+            "stops_on_first_wait",
+            "has_stop_signal",
+            "expected_wait_calls",
+            "expected_quit_calls",
+        ),
+        [
+            pytest.param(True, True, True, [1000], 0, id="running-stops-on-first-wait"),
+            pytest.param(True, False, True, [1000, 1000], 1, id="running-needs-quit-and-second-wait"),
+            pytest.param(False, False, False, [], 0, id="already-stopped-without-stop-signal"),
+        ],
+    )
+    def test_util_panel_shutdown_stops_client_worker_thread(
+        self,
+        thread_running,
+        stops_on_first_wait,
+        has_stop_signal,
+        expected_wait_calls,
+        expected_quit_calls,
+    ):
+        worker = LifecycleFakeWorker()
+        thread = LifecycleFakeThread(
+            running=thread_running,
+            stops_on_first_wait=stops_on_first_wait,
+        )
+        panel_attrs = {
+            "client_worker": worker,
+            "client_thread": thread,
+        }
+        stop_signal = None
+        if has_stop_signal:
+            stop_signal = LifecycleFakeSignal(worker.stop)
+            panel_attrs["stop_client_worker"] = stop_signal
+        panel = SimpleNamespace(**panel_attrs)
+
+        QUtilPanel.shutdown(panel)
+
+        assert worker.stop_calls == 1
+        assert thread.wait_calls == expected_wait_calls
+        assert thread.quit_calls == expected_quit_calls
+        assert (stop_signal.emit_calls if stop_signal is not None else 0) == int(has_stop_signal)
+        assert panel.client_worker is None
+        assert panel.client_thread is None
+
+
 if __name__ == "__main__":
     unittest.main(argv=sys.argv)
