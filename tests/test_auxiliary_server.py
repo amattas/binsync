@@ -1,7 +1,14 @@
+import io
+import subprocess
 import sys
+from types import SimpleNamespace
 
+import pytest
+
+import binsync.interface_overrides.ghidra as ghidra_module
 from binsync.extras.aux_server.aux_server import Server
 from binsync.extras.aux_server.store import ServerStore
+from binsync.interface_overrides.ghidra import ControlPanelWindow, GhidraRemoteInterfaceWrapper
 
 from binsync.ui.aux_server_panel.aux_server_window import ClientWorker
 from declib.ui.qt_objects import (
@@ -373,3 +380,302 @@ class TestAuxServer(unittest.TestCase):
             
 if __name__ == "__main__":
     unittest.main(argv=sys.argv)
+
+
+class _FakeGhidraProcess:
+    def __init__(self, returncode=None, timeout_on_first_wait=False):
+        self.pid = 1234
+        self.stderr = io.StringIO("")
+        self.terminated = False
+        self.killed = False
+        self.waited = False
+        self.wait_timeouts = []
+        self._returncode = returncode
+        self._timeout_on_first_wait = timeout_on_first_wait
+
+    def poll(self):
+        return self._returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        self.waited = True
+        self.wait_timeouts.append(timeout)
+        if self._timeout_on_first_wait and len(self.wait_timeouts) == 1:
+            raise subprocess.TimeoutExpired("ghidra-ui", timeout)
+        if self._returncode is None:
+            self._returncode = 0
+        return self._returncode
+
+    def kill(self):
+        self.killed = True
+        self._returncode = -9
+
+
+class _FakeGhidraServer:
+    def __init__(self):
+        self.socket_path = "/tmp/fake-ghidra.sock"
+        self.started = False
+        self.stopped = False
+        self.waited = False
+        self.requires_main_thread = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def wait_for_shutdown(self):
+        self.waited = True
+
+
+class _RecordingDecompilerClient:
+    discover_calls = []
+    decompiler = object()
+
+    @classmethod
+    def discover(cls, *args, **kwargs):
+        cls.discover_calls.append((args, kwargs))
+        return cls.decompiler
+
+
+class _FakeApplication:
+    @staticmethod
+    def instance():
+        return _FakeApplication()
+
+    def setQuitOnLastWindowClosed(self, _value):
+        pass
+
+    def exec(self):
+        pass
+
+
+class _FakeControlPanelWindow:
+    def __init__(self, deci=None):
+        self.deci = deci
+
+    def hide(self):
+        pass
+
+    def configure(self):
+        return True
+
+    def show(self):
+        pass
+
+
+class _RecordingController:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def stop_worker_routines(self):
+        self.calls.append("stop_workers")
+
+
+class _ModernRemoteInterface:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def shutdown_server(self):
+        self.calls.append("shutdown_server")
+
+
+class _LegacyRemoteInterface:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def shutdown(self):
+        self.calls.append("shutdown")
+
+
+@pytest.fixture
+def ghidra_process_launch(monkeypatch):
+    fake_process = _FakeGhidraProcess()
+    popen_calls = []
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return fake_process
+
+    monkeypatch.setattr(ghidra_module, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(ghidra_module.subprocess, "Popen", fake_popen)
+    return SimpleNamespace(process=fake_process, popen_calls=popen_calls)
+
+
+@pytest.fixture
+def ghidra_ui_dependencies(monkeypatch):
+    _RecordingDecompilerClient.discover_calls = []
+    monkeypatch.setattr("declib.api.decompiler_client.DecompilerClient", _RecordingDecompilerClient)
+    monkeypatch.setattr(ghidra_module, "QApplication", _FakeApplication)
+    monkeypatch.setattr(ghidra_module, "ControlPanelWindow", _FakeControlPanelWindow)
+    return _RecordingDecompilerClient.discover_calls
+
+
+@pytest.fixture
+def ghidra_server_runtime(monkeypatch):
+    fake_process = _FakeGhidraProcess()
+    fake_server = _FakeGhidraServer()
+    monkeypatch.setattr(ghidra_module, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(ghidra_module, "DecompilerServer", lambda **_kwargs: fake_server)
+    monkeypatch.setattr(ghidra_module.atexit, "register", lambda _callback: None)
+    monkeypatch.setattr(
+        GhidraRemoteInterfaceWrapper,
+        "start_gui_in_new_process",
+        staticmethod(lambda socket_path=None: fake_process),
+    )
+    return SimpleNamespace(process=fake_process, server=fake_server)
+
+
+class TestGhidraRemoteLifecycle:
+    @pytest.mark.parametrize(
+        "socket_path",
+        [
+            pytest.param("/tmp/declib.sock", id="explicit-socket"),
+            pytest.param(None, id="no-socket"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "configured_log_path",
+        [
+            pytest.param(True, id="configured-log"),
+            pytest.param(False, id="default-log"),
+        ],
+    )
+    def test_ui_process_launch_uses_server_and_log_configuration(
+        self,
+        monkeypatch,
+        tmp_path,
+        ghidra_process_launch,
+        socket_path,
+        configured_log_path,
+    ):
+        monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, raising=False)
+        monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH, raising=False)
+        if configured_log_path:
+            expected_log_path = tmp_path / "configured" / "ghidra-ui.log"
+            monkeypatch.setenv(ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH, str(expected_log_path))
+        else:
+            expected_log_path = tmp_path / "binsync-ghidra-ui.log"
+            monkeypatch.setattr(ghidra_module.tempfile, "gettempdir", lambda: str(tmp_path))
+
+        process = GhidraRemoteInterfaceWrapper.start_gui_in_new_process(socket_path=socket_path)
+
+        assert process is ghidra_process_launch.process
+        assert len(ghidra_process_launch.popen_calls) == 1
+        launch_kwargs = ghidra_process_launch.popen_calls[0][1]
+        if socket_path is None:
+            assert ghidra_module.BINSYNC_GHIDRA_SERVER_URL not in launch_kwargs["env"]
+        else:
+            assert launch_kwargs["env"][ghidra_module.BINSYNC_GHIDRA_SERVER_URL] == f"unix://{socket_path}"
+        assert launch_kwargs["env"][ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH] == str(expected_log_path)
+        assert launch_kwargs["stdout"].name == str(expected_log_path)
+        assert launch_kwargs["stderr"] is launch_kwargs["stdout"]
+
+    @pytest.mark.parametrize(
+        "server_url, expected_discover_call",
+        [
+            pytest.param(
+                "unix:///tmp/declib.sock",
+                ((), {"server_url": "unix:///tmp/declib.sock"}),
+                id="explicit-server-url",
+            ),
+            pytest.param(None, ((), {}), id="no-server-url"),
+        ],
+    )
+    def test_child_ui_discovers_configured_server(
+        self,
+        monkeypatch,
+        ghidra_ui_dependencies,
+        server_url,
+        expected_discover_call,
+    ):
+        monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, raising=False)
+        if server_url is not None:
+            monkeypatch.setenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, server_url)
+
+        ghidra_module.start_ghidra_ui()
+
+        assert ghidra_ui_dependencies == [expected_discover_call]
+
+    @pytest.mark.parametrize(
+        (
+            "returncode",
+            "timeout_on_first_wait",
+            "expected_terminated",
+            "expected_waited",
+            "expected_killed",
+            "expected_wait_timeouts",
+        ),
+        [
+            pytest.param(None, False, True, True, False, [3], id="normal-exit"),
+            pytest.param(None, True, True, True, True, [3, 1], id="kill-after-timeout"),
+            pytest.param(0, False, False, False, False, [], id="already-exited"),
+        ],
+    )
+    def test_wrapper_shutdown_stops_ui_process_and_server(
+        self,
+        returncode,
+        timeout_on_first_wait,
+        expected_terminated,
+        expected_waited,
+        expected_killed,
+        expected_wait_timeouts,
+    ):
+        fake_process = _FakeGhidraProcess(
+            returncode=returncode,
+            timeout_on_first_wait=timeout_on_first_wait,
+        )
+        fake_server = _FakeGhidraServer()
+        wrapper = GhidraRemoteInterfaceWrapper.__new__(GhidraRemoteInterfaceWrapper)
+        wrapper.gui_process = fake_process
+        wrapper.server = fake_server
+
+        wrapper.shutdown()
+
+        assert fake_process.terminated is expected_terminated
+        assert fake_process.waited is expected_waited
+        assert fake_process.killed is expected_killed
+        assert fake_process.wait_timeouts == expected_wait_timeouts
+        assert fake_server.stopped is True
+
+    @pytest.mark.parametrize("requires_main_thread", [True, False])
+    def test_wrapper_waits_for_main_thread_dispatch_server(
+        self,
+        ghidra_server_runtime,
+        requires_main_thread,
+    ):
+        ghidra_server_runtime.server.requires_main_thread = requires_main_thread
+
+        wrapper = GhidraRemoteInterfaceWrapper()
+
+        assert wrapper.gui_process is ghidra_server_runtime.process
+        assert ghidra_server_runtime.server.started is True
+        assert ghidra_server_runtime.server.waited is requires_main_thread
+
+    @pytest.mark.parametrize(
+        "interface_type, interface_shutdown_call",
+        [
+            pytest.param(_ModernRemoteInterface, "shutdown_server", id="modern-shutdown-server"),
+            pytest.param(_LegacyRemoteInterface, "shutdown", id="legacy-shutdown"),
+        ],
+    )
+    def test_control_panel_close_stops_workers_interface_and_application(
+        self,
+        monkeypatch,
+        interface_type,
+        interface_shutdown_call,
+    ):
+        calls = []
+        monkeypatch.setattr(ghidra_module.QTimer, "singleShot", lambda _delay, callback: callback())
+        monkeypatch.setattr(ghidra_module.QApplication, "quit", lambda: calls.append("quit"))
+        window = SimpleNamespace(
+            controller=_RecordingController(calls),
+            _interface=interface_type(calls),
+        )
+
+        ControlPanelWindow.closeEvent(window, object())
+
+        assert calls == ["stop_workers", interface_shutdown_call, "quit"]
