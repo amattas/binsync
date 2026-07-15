@@ -1,4 +1,8 @@
+import importlib
 import sys
+import types
+
+import pytest
 
 from binsync.extras.aux_server.aux_server import Server
 from binsync.extras.aux_server.store import ServerStore
@@ -371,5 +375,178 @@ class TestAuxServer(unittest.TestCase):
             ServerStore.DEFAULT_GROUPNAME: {}
         }
             
+
+
+class BinjaFakeBaseInterface:
+    def __init__(self, *args, **kwargs):
+        self.bv = kwargs.get("bv")
+
+    def _init_gui_components(self, *args, **kwargs):
+        return True
+
+
+class BinjaFakeController:
+    def __init__(self, decompiler_interface=None):
+        self.deci = decompiler_interface
+        self.stopped = False
+
+    def check_client(self):
+        return False
+
+    def stop_worker_routines(self):
+        self.stopped = True
+
+
+class BinjaFakeSidebarWidget:
+    def __init__(self, name):
+        self.name = name
+        self.layout = None
+
+    def setLayout(self, layout):
+        self.layout = layout
+
+
+class BinjaFakeLayout:
+    def __init__(self):
+        self.widgets = []
+
+    def addWidget(self, widget):
+        self.widgets.append(widget)
+
+
+BINJA_MODULE_NAME = "binsync.interface_overrides.binja"
+BINJA_PARENT_MODULE_NAME = "binsync.interface_overrides"
+BINJA_FAKE_MODULE_NAMES = (
+    "declib.decompilers.binja.interface",
+    "binaryninjaui",
+    BINJA_MODULE_NAME,
+)
+BINJA_MISSING_MODULE = object()
+
+
+@pytest.fixture
+def fake_binja_modules():
+    parent_module = importlib.import_module(BINJA_PARENT_MODULE_NAME)
+    original_parent_attribute = vars(parent_module).get("binja", BINJA_MISSING_MODULE)
+    original_modules = {
+        module_name: sys.modules.get(module_name, BINJA_MISSING_MODULE)
+        for module_name in BINJA_FAKE_MODULE_NAMES
+    }
+
+    fake_binja_interface_module = types.ModuleType("declib.decompilers.binja.interface")
+    fake_binja_interface_module.BinjaInterface = BinjaFakeBaseInterface
+    sys.modules["declib.decompilers.binja.interface"] = fake_binja_interface_module
+
+    fake_ui_module = types.ModuleType("binaryninjaui")
+    fake_ui_module.UIAction = object
+    fake_ui_module.UIActionHandler = object
+    fake_ui_module.Menu = object
+    fake_ui_module.SidebarWidget = BinjaFakeSidebarWidget
+    fake_ui_module.SidebarWidgetType = object
+    fake_ui_module.Sidebar = object
+    sys.modules["binaryninjaui"] = fake_ui_module
+    sys.modules.pop(BINJA_MODULE_NAME, None)
+
+    try:
+        yield
+    finally:
+        for module_name, original_module in original_modules.items():
+            if original_module is BINJA_MISSING_MODULE:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = original_module
+        if original_parent_attribute is BINJA_MISSING_MODULE:
+            vars(parent_module).pop("binja", None)
+        else:
+            parent_module.binja = original_parent_attribute
+
+
+@pytest.fixture
+def binja_module(fake_binja_modules, monkeypatch):
+    module = importlib.import_module(BINJA_MODULE_NAME)
+    monkeypatch.setattr(module, "BSController", BinjaFakeController)
+    monkeypatch.setattr(module, "ControlPanel", lambda controller: {"controller": controller})
+    monkeypatch.setattr(module, "QVBoxLayout", BinjaFakeLayout)
+
+    try:
+        yield module
+    finally:
+        sys.modules.pop(BINJA_MODULE_NAME, None)
+
+
+@pytest.fixture
+def binja_interface(binja_module):
+    yield binja_module.BinjaBSInterface()
+
+
+class TestBinjaControllerLifecycle:
+    @pytest.mark.parametrize(
+        ("view_tokens", "expected_controller_count", "expected_same_controller"),
+        [
+            pytest.param((None,), 0, None, id="none"),
+            pytest.param(("shared", "shared"), 1, True, id="repeated-same-binary-view"),
+            pytest.param(("first", "second"), 2, False, id="distinct-binary-views"),
+        ],
+    )
+    def test_controller_for_bv(
+        self,
+        binja_interface,
+        view_tokens,
+        expected_controller_count,
+        expected_same_controller,
+    ):
+        binary_views = {
+            token: object()
+            for token in view_tokens
+            if token is not None
+        }
+        views = [binary_views[token] if token is not None else None for token in view_tokens]
+
+        controllers = [binja_interface.controller_for_bv(view) for view in views]
+
+        assert len(binja_interface.controllers) == expected_controller_count
+        for view, controller in zip(views, controllers):
+            if view is None:
+                assert controller is None
+            else:
+                assert controller.deci.bv is view
+        if expected_same_controller is not None:
+            assert (controllers[0] is controllers[1]) is expected_same_controller
+
+    def test_launch_config_without_current_view_is_noop(self, binja_interface):
+        class FakeContext:
+            def getCurrentView(self):
+                return None
+
+        class FakeActionContext:
+            context = FakeContext()
+
+        binja_interface._launch_bs_config(FakeActionContext())
+
+        assert binja_interface.controllers == {}
+
+    def test_sidebar_creates_controller_for_binary_view(self, binja_module, binja_interface):
+        bv = object()
+
+        widget = binja_module.BinSyncSidebarWidget(bv, binja_interface)
+
+        assert binja_interface.controllers[bv] is widget._controller
+        assert widget._controller.deci.bv is bv
+        assert widget._widget == {"controller": widget._controller}
+        assert widget.layout.widgets == [widget._widget]
+
+    def test_stop_controllers_stops_and_clears_all_controllers(self, binja_interface):
+        controllers = [BinjaFakeController(), BinjaFakeController()]
+        binja_interface.controllers = {
+            object(): controllers[0],
+            object(): controllers[1],
+        }
+
+        binja_interface.stop_controllers()
+
+        assert all(controller.stopped for controller in controllers)
+        assert binja_interface.controllers == {}
+
+
 if __name__ == "__main__":
     unittest.main(argv=sys.argv)
