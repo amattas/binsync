@@ -1,3 +1,4 @@
+import binsync.extras.aux_server as aux_server
 import urllib.parse
 import requests
 import logging
@@ -28,9 +29,7 @@ class ServerClient():
         self.old_post_data = {}
         self.connected = False
         self.callback_registered = False
-        
-    
-    
+
     def connect(self):
         self.server_url = f"http://{self.host}:{self.port}"
         self._etag = None
@@ -39,6 +38,31 @@ class ServerClient():
             l.error("HOST AND PORT COMBINATION IS NOT VALID: NETLOC %s BUT HOST %s AND PORT %s",parsed.netloc,parsed.hostname,parsed.port)
         self.sess = requests.Session()
         try:
+            client_version_nums = aux_server.__version__.split(".")
+            server_version = self.sess.get(self.server_url+"/version").text
+            server_version_nums = server_version.split(".")
+            if len(server_version_nums) != 3:
+                raise ValueError(f"Server version was expected to have 3 parts but had {len(server_version_nums)}")
+            
+            # Compare versions
+            if client_version_nums[0] != server_version_nums[0]:
+                l.error("Client major version (%s) and server major version (%s) do not match. Refusing to connect." \
+                        " Update the out-of-date application to restore functionality.", 
+                        client_version_nums[0], server_version_nums[0])
+                return False
+            elif client_version_nums[1] != server_version_nums[1]:
+                l.warning("Client minor version (%s) and server minor version (%s) do not match." \
+                        " Can still connect, but there may be some missing functionality." \
+                        " Update the out-of-date application for full functionality.")
+            # Patch version difference should not be relevant
+        except requests.ConnectionError as e:
+            l.info("Unable to establish a connection with the auxiliary server")
+            return False
+        except ValueError as e:
+            l.error("Tried to get version from auxiliary server but response was malformed. Encountered error: %s", e)
+            return False
+
+        try:
             l.info(self.sess.get(self.server_url+"/connect").text)
             self.connected = True
             self.controller.deci.artifact_change_callbacks[Context].append(self._submit_new_context)
@@ -46,6 +70,7 @@ class ServerClient():
             self._submit_new_context(self.controller.deci.gui_active_context())
             return True
         except requests.ConnectionError:
+            l.info("Unable to establish a connection with the auxiliary server")
             return False
 
     @_connection_required
