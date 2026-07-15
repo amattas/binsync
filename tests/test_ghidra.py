@@ -1,5 +1,6 @@
 import io
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +9,7 @@ import binsync.interface_overrides.ghidra as ghidra_module
 from binsync.interface_overrides.ghidra import ControlPanelWindow, GhidraRemoteInterfaceWrapper
 
 
-class FakeProcess:
+class MockProcess:
     def __init__(self, returncode=None, timeout_on_first_wait=False):
         self.pid = 1234
         self.stderr = io.StringIO("")
@@ -41,7 +42,7 @@ class FakeProcess:
         self._returncode = -9
 
 
-class FakeServer:
+class MockServer:
     def __init__(self):
         self.socket_path = "/tmp/fake-ghidra.sock"
         self.started = False
@@ -61,197 +62,229 @@ class FakeServer:
         self.waited = True
 
 
-@pytest.mark.parametrize(
-    "socket_path",
-    [None, "/tmp/declib.sock"],
-    ids=("default-environment", "explicit-server-and-log"),
-)
-def test_ghidra_ui_process_launch_configuration(monkeypatch, tmp_path, socket_path):
-    fake_proc = FakeProcess()
+def _patch_popen_capture(monkeypatch, mock_proc):
+    """Patch subprocess.Popen to capture call args/kwargs and return mock_proc."""
     popen_calls = []
-    monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, raising=False)
-    monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH, raising=False)
-    monkeypatch.setattr(ghidra_module.tempfile, "gettempdir", lambda: str(tmp_path))
-    expected_log_path = tmp_path / ("ghidra-ui.log" if socket_path else "binsync-ghidra-ui.log")
-    if socket_path is not None:
-        monkeypatch.setenv(ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH, str(expected_log_path))
-    monkeypatch.setattr("binsync.interface_overrides.ghidra.sleep", lambda _seconds: None)
 
-    def fake_popen(*args, **kwargs):
+    def mock_popen(*args, **kwargs):
         popen_calls.append((args, kwargs))
-        return fake_proc
+        return mock_proc
 
-    monkeypatch.setattr("binsync.interface_overrides.ghidra.subprocess.Popen", fake_popen)
-
-    proc = GhidraRemoteInterfaceWrapper.start_gui_in_new_process(socket_path=socket_path)
-
-    assert proc is fake_proc
-    launch_env = popen_calls[0][1]["env"]
-    if socket_path is None:
-        assert ghidra_module.BINSYNC_GHIDRA_SERVER_URL not in launch_env
-    else:
-        assert launch_env[ghidra_module.BINSYNC_GHIDRA_SERVER_URL] == f"unix://{socket_path}"
-    assert launch_env[ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH] == str(expected_log_path)
-    assert popen_calls[0][1]["stdout"].name == str(expected_log_path)
-    assert popen_calls[0][1]["stderr"] is popen_calls[0][1]["stdout"]
+    monkeypatch.setattr("binsync.interface_overrides.ghidra.subprocess.Popen", mock_popen)
+    return popen_calls
 
 
-@pytest.mark.parametrize(
-    "server_url",
-    [None, "unix:///tmp/declib.sock"],
-    ids=("discover-default-server", "discover-explicit-server"),
-)
-def test_start_ghidra_ui_discovers_child_process_server(monkeypatch, server_url):
-    discover_calls = []
-    fake_deci = object()
+class TestGhidra:
+    """Tests for the Ghidra remote interface wrapper and UI process lifecycle.
 
-    class FakeDecompilerClient:
-        @staticmethod
-        def discover(*args, **kwargs):
-            discover_calls.append((args, kwargs))
-            return fake_deci
+    Note: a plain class is used instead of unittest.TestCase because pytest
+    parameterization does not work on TestCase methods and results in cleaner tests.
+    """
 
-    class FakeApplication:
-        @staticmethod
-        def instance():
-            return FakeApplication()
-
-        def setQuitOnLastWindowClosed(self, _value):
-            pass
-
-        def exec(self):
-            pass
-
-    class FakeControlPanelWindow:
-        def __init__(self, deci=None):
-            self.deci = deci
-
-        def hide(self):
-            pass
-
-        def configure(self):
-            return True
-
-        def show(self):
-            pass
-
-    monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, raising=False)
-    if server_url is not None:
-        monkeypatch.setenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, server_url)
-    monkeypatch.setattr("declib.api.decompiler_client.DecompilerClient", FakeDecompilerClient)
-    monkeypatch.setattr(ghidra_module, "QApplication", FakeApplication)
-    monkeypatch.setattr(ghidra_module, "ControlPanelWindow", FakeControlPanelWindow)
-
-    ghidra_module.start_ghidra_ui()
-
-    expected_kwargs = {"server_url": server_url} if server_url is not None else {}
-    assert discover_calls == [((), expected_kwargs)]
-
-
-@pytest.mark.parametrize(
-    ("returncode", "timeout_on_first_wait", "expected_terminate_calls", "expected_waits", "expected_kill_calls"),
-    [
-        (None, False, 1, [3], 0),
-        (None, True, 1, [3, 1], 1),
-        (0, False, 0, [], 0),
-    ],
-    ids=("normal-process", "timeout-and-kill", "already-exited-process"),
-)
-def test_ghidra_wrapper_shutdown_terminates_ui_process_and_server(
-    returncode, timeout_on_first_wait, expected_terminate_calls, expected_waits, expected_kill_calls
-):
-    fake_proc = FakeProcess(returncode=returncode, timeout_on_first_wait=timeout_on_first_wait)
-    fake_server = FakeServer()
-    wrapper = GhidraRemoteInterfaceWrapper.__new__(GhidraRemoteInterfaceWrapper)
-    wrapper.gui_process = fake_proc
-    wrapper.server = fake_server
-
-    wrapper.shutdown()
-    wrapper.shutdown()
-
-    assert fake_proc.terminate_calls == expected_terminate_calls
-    assert fake_proc.wait_timeouts == expected_waits
-    assert fake_proc.kill_calls == expected_kill_calls
-    assert fake_server.stopped is True
-    assert fake_server.stop_calls == 1
-
-
-@pytest.mark.parametrize("requires_main_thread", [True, False], ids=("main-thread", "background-thread"))
-def test_ghidra_wrapper_waits_for_main_thread_dispatch_server(monkeypatch, requires_main_thread):
-    fake_proc = FakeProcess()
-    fake_server = FakeServer()
-    fake_server.requires_main_thread = requires_main_thread
-    monkeypatch.setattr("binsync.interface_overrides.ghidra.sleep", lambda _seconds: None)
-    monkeypatch.setattr("binsync.interface_overrides.ghidra.DecompilerServer", lambda **_kwargs: fake_server)
-    monkeypatch.setattr("binsync.interface_overrides.ghidra.atexit.register", lambda _callback: None)
-    monkeypatch.setattr(
-        GhidraRemoteInterfaceWrapper,
-        "start_gui_in_new_process",
-        staticmethod(lambda socket_path=None: fake_proc),
+    @pytest.mark.parametrize(
+        "socket_path",
+        [None, "/tmp/declib.sock"],
+        ids=("default-server", "explicit-server"),
     )
+    def test_launch_server_url(self, monkeypatch, tmp_path, socket_path):
+        mock_proc = MockProcess()
+        monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, raising=False)
+        monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH, raising=False)
+        monkeypatch.setattr(ghidra_module.tempfile, "gettempdir", lambda: str(tmp_path))
+        monkeypatch.setattr("binsync.interface_overrides.ghidra.sleep", lambda _seconds: None)
+        popen_calls = _patch_popen_capture(monkeypatch, mock_proc)
 
-    wrapper = GhidraRemoteInterfaceWrapper()
+        proc = GhidraRemoteInterfaceWrapper.start_gui_in_new_process(socket_path=socket_path)
 
-    assert wrapper.gui_process is fake_proc
-    assert fake_server.started is True
-    assert fake_server.waited is requires_main_thread
+        assert proc is mock_proc
+        launch_env = popen_calls[0][1]["env"]
+        if socket_path is None:
+            assert ghidra_module.BINSYNC_GHIDRA_SERVER_URL not in launch_env
+        else:
+            assert launch_env[ghidra_module.BINSYNC_GHIDRA_SERVER_URL] == f"unix://{socket_path}"
+
+    @pytest.mark.parametrize(
+        "explicit_log_path",
+        [False, True],
+        ids=("default-log-path", "explicit-log-path"),
+    )
+    def test_launch_log_path(self, monkeypatch, tmp_path, explicit_log_path):
+        mock_proc = MockProcess()
+        monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, raising=False)
+        monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH, raising=False)
+        monkeypatch.setattr(ghidra_module.tempfile, "gettempdir", lambda: str(tmp_path))
+        monkeypatch.setattr("binsync.interface_overrides.ghidra.sleep", lambda _seconds: None)
+
+        if explicit_log_path:
+            expected_log_path = tmp_path / "ghidra-ui.log"
+            monkeypatch.setenv(ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH, str(expected_log_path))
+        else:
+            expected_log_path = tmp_path / "binsync-ghidra-ui.log"
+
+        popen_calls = _patch_popen_capture(monkeypatch, mock_proc)
+
+        proc = GhidraRemoteInterfaceWrapper.start_gui_in_new_process(socket_path=None)
+
+        assert proc is mock_proc
+        launch_kwargs = popen_calls[0][1]
+        assert launch_kwargs["env"][ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH] == str(expected_log_path)
+        assert launch_kwargs["stdout"].name == str(expected_log_path)
+        assert launch_kwargs["stderr"] is launch_kwargs["stdout"]
+
+    @pytest.mark.parametrize(
+        "server_url",
+        [None, "unix:///tmp/declib.sock"],
+        ids=("discover-default-server", "discover-explicit-server"),
+    )
+    def test_ui_discovers_server_url(self, monkeypatch, server_url):
+        discover_calls = []
+        mock_deci = object()
+
+        class MockDecompilerClient:
+            @staticmethod
+            def discover(*args, **kwargs):
+                discover_calls.append((args, kwargs))
+                return mock_deci
+
+        class MockApplication:
+            @staticmethod
+            def instance():
+                return MockApplication()
+
+            def setQuitOnLastWindowClosed(self, _value):
+                pass
+
+            def exec(self):
+                pass
+
+        class MockControlPanelWindow:
+            def __init__(self, deci=None):
+                self.deci = deci
+
+            def hide(self):
+                pass
+
+            def configure(self):
+                return True
+
+            def show(self):
+                pass
+
+        monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, raising=False)
+        if server_url is not None:
+            monkeypatch.setenv(ghidra_module.BINSYNC_GHIDRA_SERVER_URL, server_url)
+        monkeypatch.setattr("declib.api.decompiler_client.DecompilerClient", MockDecompilerClient)
+        monkeypatch.setattr(ghidra_module, "QApplication", MockApplication)
+        monkeypatch.setattr(ghidra_module, "ControlPanelWindow", MockControlPanelWindow)
+
+        ghidra_module.start_ghidra_ui()
+
+        expected_kwargs = {"server_url": server_url} if server_url is not None else {}
+        assert discover_calls == [((), expected_kwargs)]
+
+    @pytest.mark.parametrize(
+        ("returncode", "timeout_on_first_wait", "expected_terminate_calls", "expected_waits", "expected_kill_calls"),
+        [
+            (None, False, 1, [3], 0),
+            (None, True, 1, [3, 1], 1),
+            (0, False, 0, [], 0),
+        ],
+        ids=("normal-process", "timeout-and-kill", "already-exited-process"),
+    )
+    def test_wrapper_shutdown(
+        self, returncode, timeout_on_first_wait, expected_terminate_calls, expected_waits, expected_kill_calls
+    ):
+        mock_proc = MockProcess(returncode=returncode, timeout_on_first_wait=timeout_on_first_wait)
+        mock_server = MockServer()
+        wrapper = GhidraRemoteInterfaceWrapper.__new__(GhidraRemoteInterfaceWrapper)
+        wrapper.gui_process = mock_proc
+        wrapper.server = mock_server
+
+        wrapper.shutdown()
+        wrapper.shutdown()
+
+        assert mock_proc.terminate_calls == expected_terminate_calls
+        assert mock_proc.wait_timeouts == expected_waits
+        assert mock_proc.kill_calls == expected_kill_calls
+        assert mock_server.stopped is True
+        assert mock_server.stop_calls == 1
+
+    @pytest.mark.parametrize("requires_main_thread", [True, False], ids=("main-thread", "background-thread"))
+    def test_wrapper_main_thread_wait(self, monkeypatch, requires_main_thread):
+        mock_proc = MockProcess()
+        mock_server = MockServer()
+        mock_server.requires_main_thread = requires_main_thread
+        monkeypatch.setattr("binsync.interface_overrides.ghidra.sleep", lambda _seconds: None)
+        monkeypatch.setattr("binsync.interface_overrides.ghidra.DecompilerServer", lambda **_kwargs: mock_server)
+        monkeypatch.setattr("binsync.interface_overrides.ghidra.atexit.register", lambda _callback: None)
+        monkeypatch.setattr(
+            GhidraRemoteInterfaceWrapper,
+            "start_gui_in_new_process",
+            staticmethod(lambda socket_path=None: mock_proc),
+        )
+
+        wrapper = GhidraRemoteInterfaceWrapper()
+
+        assert wrapper.gui_process is mock_proc
+        assert mock_server.started is True
+        assert mock_server.waited is requires_main_thread
+
+    @pytest.mark.parametrize(
+        ("shutdown_method", "expected_shutdown_call"),
+        [("shutdown_server", "shutdown_server"), ("shutdown", "interface_shutdown")],
+        ids=("modern-interface", "legacy-interface"),
+    )
+    def test_control_panel_close_shutdown(self, monkeypatch, shutdown_method, expected_shutdown_call):
+        calls = []
+
+        class MockController:
+            def stop_worker_routines(self):
+                calls.append("stop_workers")
+
+            def shutdown(self):
+                calls.append("controller_shutdown")
+
+        monkeypatch.setattr("binsync.interface_overrides.ghidra.QTimer.singleShot", lambda _delay, callback: callback())
+        monkeypatch.setattr("binsync.interface_overrides.ghidra.QApplication.quit", lambda: calls.append("quit"))
+
+        remote_interface = SimpleNamespace()
+        setattr(remote_interface, shutdown_method, lambda: calls.append(expected_shutdown_call))
+        window = SimpleNamespace(controller=MockController(), _interface=remote_interface)
+
+        ControlPanelWindow.closeEvent(window, object())
+
+        assert calls == ["stop_workers", expected_shutdown_call, "quit"]
+
+    @pytest.mark.parametrize("successful_attempt", [2, None], ids=("retry-succeeds", "exhausted"))
+    def test_launch_retries_or_exhausts(self, monkeypatch, tmp_path, successful_attempt):
+        popen_calls = []
+        processes = []
+        monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH, raising=False)
+        monkeypatch.setattr(ghidra_module.tempfile, "gettempdir", lambda: str(tmp_path))
+        monkeypatch.setattr(ghidra_module, "sleep", lambda _seconds: None)
+
+        def mock_popen(*args, **kwargs):
+            popen_calls.append((args, kwargs))
+            attempt = len(popen_calls)
+            proc = MockProcess(returncode=None if attempt == successful_attempt else 1)
+            processes.append(proc)
+            return proc
+
+        monkeypatch.setattr(ghidra_module.subprocess, "Popen", mock_popen)
+
+        if successful_attempt is None:
+            with pytest.raises(RuntimeError, match="Exhausted all methods"):
+                GhidraRemoteInterfaceWrapper.start_gui_in_new_process()
+            assert len(popen_calls) == 3
+        else:
+            proc = GhidraRemoteInterfaceWrapper.start_gui_in_new_process()
+            assert proc is processes[successful_attempt - 1]
+            assert len(popen_calls) == successful_attempt
+
+        assert popen_calls[0][0][0][0] == ghidra_module.sys.executable
+        if len(popen_calls) > 1:
+            assert popen_calls[1][0][0][0] == "binsync"
 
 
-@pytest.mark.parametrize(
-    ("shutdown_method", "expected_shutdown_call"),
-    [("shutdown_server", "shutdown_server"), ("shutdown", "interface_shutdown")],
-    ids=("modern-interface", "legacy-interface"),
-)
-def test_ghidra_control_panel_close_requests_remote_server_stop(
-    monkeypatch, shutdown_method, expected_shutdown_call
-):
-    calls = []
-
-    class FakeController:
-        def stop_worker_routines(self):
-            calls.append("stop_workers")
-
-        def shutdown(self):
-            calls.append("controller_shutdown")
-
-    monkeypatch.setattr("binsync.interface_overrides.ghidra.QTimer.singleShot", lambda _delay, callback: callback())
-    monkeypatch.setattr("binsync.interface_overrides.ghidra.QApplication.quit", lambda: calls.append("quit"))
-
-    remote_interface = SimpleNamespace()
-    setattr(remote_interface, shutdown_method, lambda: calls.append(expected_shutdown_call))
-    window = SimpleNamespace(controller=FakeController(), _interface=remote_interface)
-
-    ControlPanelWindow.closeEvent(window, object())
-
-    assert calls == ["stop_workers", expected_shutdown_call, "quit"]
-
-
-@pytest.mark.parametrize("successful_attempt", [2, None], ids=("retry-succeeds", "exhausted"))
-def test_ghidra_ui_process_launch_retries_or_exhausts(monkeypatch, tmp_path, successful_attempt):
-    popen_calls = []
-    processes = []
-    monkeypatch.delenv(ghidra_module.BINSYNC_GHIDRA_UI_LOG_PATH, raising=False)
-    monkeypatch.setattr(ghidra_module.tempfile, "gettempdir", lambda: str(tmp_path))
-    monkeypatch.setattr(ghidra_module, "sleep", lambda _seconds: None)
-
-    def fake_popen(*args, **kwargs):
-        popen_calls.append((args, kwargs))
-        attempt = len(popen_calls)
-        proc = FakeProcess(returncode=None if attempt == successful_attempt else 1)
-        processes.append(proc)
-        return proc
-
-    monkeypatch.setattr(ghidra_module.subprocess, "Popen", fake_popen)
-
-    if successful_attempt is None:
-        with pytest.raises(RuntimeError, match="Exhausted all methods"):
-            GhidraRemoteInterfaceWrapper.start_gui_in_new_process()
-        assert len(popen_calls) == 3
-    else:
-        proc = GhidraRemoteInterfaceWrapper.start_gui_in_new_process()
-        assert proc is processes[successful_attempt - 1]
-        assert len(popen_calls) == successful_attempt
-
-    assert popen_calls[0][0][0][0] == ghidra_module.sys.executable
-    if len(popen_calls) > 1:
-        assert popen_calls[1][0][0][0] == "binsync"
+if __name__ == "__main__":
+    pytest.main(args=sys.argv)

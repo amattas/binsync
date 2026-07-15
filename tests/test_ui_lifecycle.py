@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +18,7 @@ from binsync.ui.panel_tabs.util_panel import QUtilPanel
 from declib.artifacts import Function, GlobalVariable, Struct
 
 
-class FakeUtilitiesPanel:
+class MockUtilitiesPanel:
     def __init__(self):
         self.shutdown_called = False
 
@@ -25,7 +26,7 @@ class FakeUtilitiesPanel:
         self.shutdown_called = True
 
 
-class FakeWorker:
+class MockWorker:
     def __init__(self):
         self.stopped = False
 
@@ -33,7 +34,7 @@ class FakeWorker:
         self.stopped = True
 
 
-class FakeSignal:
+class MockSignal:
     def __init__(self, callback=None):
         self.callbacks = [] if callback is None else [callback]
         self.emitted = False
@@ -47,7 +48,7 @@ class FakeSignal:
             callback(*args)
 
 
-class FakeThread:
+class MockThread:
     def __init__(self, running=True, stop_on_wait=False):
         self.quit_called = False
         self.wait_timeouts = []
@@ -67,12 +68,12 @@ class FakeThread:
             self._running = False
 
 
-class FakeAction:
+class MockAction:
     def __init__(self, text, parent=None):
         self.text = text
         self.parent = parent
-        self.triggered = FakeSignal()
-        self.hovered = FakeSignal()
+        self.triggered = MockSignal()
+        self.hovered = MockSignal()
 
     def setCheckable(self, _checkable):
         pass
@@ -81,25 +82,25 @@ class FakeAction:
         pass
 
 
-class FakeMenu:
+class MockMenu:
     def __init__(self, parent=None, title=None):
         self.parent = parent
         self.title = title
         self.actions = {}
         self.submenus = {}
-        self.hovered = FakeSignal()
-        self.aboutToHide = FakeSignal()
+        self.hovered = MockSignal()
+        self.aboutToHide = MockSignal()
 
     def setObjectName(self, _name):
         pass
 
     def addMenu(self, title):
-        menu = FakeMenu(parent=self, title=title)
+        menu = MockMenu(parent=self, title=title)
         self.submenus[title] = menu
         return menu
 
     def addAction(self, action_or_text, callback=None):
-        action = action_or_text if isinstance(action_or_text, FakeAction) else FakeAction(action_or_text, parent=self)
+        action = action_or_text if isinstance(action_or_text, MockAction) else MockAction(action_or_text, parent=self)
         if callback is not None:
             action.triggered.connect(callback)
         self.actions[action.text] = action
@@ -112,7 +113,7 @@ class FakeMenu:
         pass
 
 
-class FakeIndex:
+class MockIndex:
     @staticmethod
     def row():
         return 0
@@ -122,17 +123,17 @@ class FakeIndex:
         return True
 
 
-class FakeProxyModel:
+class MockProxyModel:
     @staticmethod
     def index(_row, _column):
-        return FakeIndex()
+        return MockIndex()
 
     @staticmethod
     def mapToSource(index):
         return index
 
 
-class FakePoint:
+class MockPoint:
     @staticmethod
     def x():
         return -1
@@ -142,7 +143,7 @@ class FakePoint:
         return -1
 
 
-class FakeController:
+class MockController:
     def __init__(self):
         self.fill_artifact = object()
         self.sync_all = object()
@@ -267,108 +268,117 @@ UI_DISPATCH_CASES = (
 )
 
 
-@pytest.mark.parametrize("callbacks_owned", [True, False], ids=("owned", "foreign"))
-def test_control_panel_close_only_clears_registered_callbacks(callbacks_owned):
-    controller = SimpleNamespace()
-    utilities_panel = FakeUtilitiesPanel()
-    panel = SimpleNamespace(
-        controller=controller,
-        _utilities_panel=utilities_panel,
-        update_callback=object(),
-        ctx_callback=object(),
+class TestUILifecycle:
+    """Tests for control-panel/util-panel shutdown and table context-menu sync dispatch.
+
+    Note: a plain class is used instead of unittest.TestCase because pytest
+    parameterization does not work on TestCase methods and results in cleaner tests.
+    """
+
+    @pytest.mark.parametrize("callbacks_owned", [True, False], ids=("owned", "foreign"))
+    def test_control_panel_close_callbacks(self, callbacks_owned):
+        controller = SimpleNamespace()
+        utilities_panel = MockUtilitiesPanel()
+        panel = SimpleNamespace(
+            controller=controller,
+            _utilities_panel=utilities_panel,
+            update_callback=object(),
+            ctx_callback=object(),
+        )
+        foreign_update_callback = object()
+        foreign_ctx_callback = object()
+        controller.ui_callback = panel.update_callback if callbacks_owned else foreign_update_callback
+        controller.ctx_change_callback = panel.ctx_callback if callbacks_owned else foreign_ctx_callback
+        controller.client_init_callback = object()
+
+        ControlPanel.closeEvent(panel, object())
+
+        assert utilities_panel.shutdown_called is True
+        assert controller.ui_callback is (None if callbacks_owned else foreign_update_callback)
+        assert controller.ctx_change_callback is (None if callbacks_owned else foreign_ctx_callback)
+        assert controller.client_init_callback is None
+
+    @pytest.mark.parametrize(
+        ("running", "stop_on_wait", "use_signal", "expected_quit", "expected_waits"),
+        [
+            (True, True, True, False, [1000]),
+            (True, False, True, True, [1000, 1000]),
+            (False, False, False, False, []),
+        ],
+        ids=("stops-during-first-wait", "requires-quit", "already-stopped-without-signal"),
     )
-    foreign_update_callback = object()
-    foreign_ctx_callback = object()
-    controller.ui_callback = panel.update_callback if callbacks_owned else foreign_update_callback
-    controller.ctx_change_callback = panel.ctx_callback if callbacks_owned else foreign_ctx_callback
-    controller.client_init_callback = object()
+    def test_util_panel_shutdown(
+        self, running, stop_on_wait, use_signal, expected_quit, expected_waits
+    ):
+        worker = MockWorker()
+        thread = MockThread(running=running, stop_on_wait=stop_on_wait)
+        panel = SimpleNamespace(
+            client_worker=worker,
+            client_thread=thread,
+            stop_client_worker=MockSignal(worker.stop) if use_signal else None,
+        )
 
-    ControlPanel.closeEvent(panel, object())
+        QUtilPanel.shutdown(panel)
 
-    assert utilities_panel.shutdown_called is True
-    assert controller.ui_callback is (None if callbacks_owned else foreign_update_callback)
-    assert controller.ctx_change_callback is (None if callbacks_owned else foreign_ctx_callback)
-    assert controller.client_init_callback is None
+        assert worker.stopped is True
+        assert thread.quit_called is expected_quit
+        assert thread.wait_timeouts == expected_waits
+        assert panel.client_worker is None
+        assert panel.client_thread is None
+
+    @pytest.mark.parametrize("case", UI_DISPATCH_CASES)
+    def test_sync_actions_schedule_jobs(self, monkeypatch, case):
+        root_menus = []
+
+        def make_menu(parent=None):
+            menu = MockMenu(parent=parent)
+            root_menus.append(menu)
+            return menu
+
+        monkeypatch.setattr(case.module, "QMenu", make_menu)
+        monkeypatch.setattr(case.module, "QAction", MockAction)
+
+        controller = MockController()
+        model = SimpleNamespace(
+            row_data=case.row_data,
+            saved_ctx=getattr(case, "saved_ctx", None),
+        )
+        table = SimpleNamespace(
+            controller=controller,
+            model=model,
+            proxymodel=MockProxyModel(),
+            HEADER=case.view_cls.HEADER,
+            column_visibility=[True] * len(case.view_cls.HEADER),
+            rowAt=lambda _y: 0,
+            mapToGlobal=lambda point: point,
+            _col_hide_handler=lambda _index: None,
+            reset_tooltip_state=lambda: None,
+            bind_tooltip_menu=lambda _menu: None,
+            handle_menu_hovered_action=lambda _action: None,
+            show_tooltip=lambda *_args, **_kwargs: None,
+        )
+        for attr in ("COL_ADDR", "COL_KIND", "COL_NAME", "COL_USER"):
+            if hasattr(case.view_cls, attr):
+                setattr(table, attr, getattr(case.view_cls, attr))
+
+        valid_attr = getattr(case, "valid_attr", None)
+        if valid_attr == "_get_valid_users_for_type":
+            setattr(table, valid_attr, lambda _name, _kind: iter(case.valid_values))
+        elif valid_attr is not None:
+            setattr(table, valid_attr, lambda _identifier: iter(case.valid_values))
+
+        event = SimpleNamespace(pos=lambda: MockPoint())
+        case.view_cls.contextMenuEvent(table, event)
+
+        menu = root_menus[0]
+        for submenu_name in case.action_path[:-1]:
+            menu = menu.submenus[submenu_name]
+        menu.actions[case.action_path[-1]].triggered.emit(False)
+
+        assert controller.scheduled_jobs == [
+            (getattr(controller, case.target), case.args, case.kwargs)
+        ]
 
 
-@pytest.mark.parametrize(
-    ("running", "stop_on_wait", "use_signal", "expected_quit", "expected_waits"),
-    [
-        (True, True, True, False, [1000]),
-        (True, False, True, True, [1000, 1000]),
-        (False, False, False, False, []),
-    ],
-    ids=("stops-during-first-wait", "requires-quit", "already-stopped-without-signal"),
-)
-def test_util_panel_shutdown_handles_worker_thread_states(
-    running, stop_on_wait, use_signal, expected_quit, expected_waits
-):
-    worker = FakeWorker()
-    thread = FakeThread(running=running, stop_on_wait=stop_on_wait)
-    panel = SimpleNamespace(
-        client_worker=worker,
-        client_thread=thread,
-        stop_client_worker=FakeSignal(worker.stop) if use_signal else None,
-    )
-
-    QUtilPanel.shutdown(panel)
-
-    assert worker.stopped is True
-    assert thread.quit_called is expected_quit
-    assert thread.wait_timeouts == expected_waits
-    assert panel.client_worker is None
-    assert panel.client_thread is None
-
-
-@pytest.mark.parametrize("case", UI_DISPATCH_CASES)
-def test_ui_sync_actions_schedule_expected_controller_job(monkeypatch, case):
-    root_menus = []
-
-    def make_menu(parent=None):
-        menu = FakeMenu(parent=parent)
-        root_menus.append(menu)
-        return menu
-
-    monkeypatch.setattr(case.module, "QMenu", make_menu)
-    monkeypatch.setattr(case.module, "QAction", FakeAction)
-
-    controller = FakeController()
-    model = SimpleNamespace(
-        row_data=case.row_data,
-        saved_ctx=getattr(case, "saved_ctx", None),
-    )
-    table = SimpleNamespace(
-        controller=controller,
-        model=model,
-        proxymodel=FakeProxyModel(),
-        HEADER=case.view_cls.HEADER,
-        column_visibility=[True] * len(case.view_cls.HEADER),
-        rowAt=lambda _y: 0,
-        mapToGlobal=lambda point: point,
-        _col_hide_handler=lambda _index: None,
-        reset_tooltip_state=lambda: None,
-        bind_tooltip_menu=lambda _menu: None,
-        handle_menu_hovered_action=lambda _action: None,
-        show_tooltip=lambda *_args, **_kwargs: None,
-    )
-    for attr in ("COL_ADDR", "COL_KIND", "COL_NAME", "COL_USER"):
-        if hasattr(case.view_cls, attr):
-            setattr(table, attr, getattr(case.view_cls, attr))
-
-    valid_attr = getattr(case, "valid_attr", None)
-    if valid_attr == "_get_valid_users_for_type":
-        setattr(table, valid_attr, lambda _name, _kind: iter(case.valid_values))
-    elif valid_attr is not None:
-        setattr(table, valid_attr, lambda _identifier: iter(case.valid_values))
-
-    event = SimpleNamespace(pos=lambda: FakePoint())
-    case.view_cls.contextMenuEvent(table, event)
-
-    menu = root_menus[0]
-    for submenu_name in case.action_path[:-1]:
-        menu = menu.submenus[submenu_name]
-    menu.actions[case.action_path[-1]].triggered.emit(False)
-
-    assert controller.scheduled_jobs == [
-        (getattr(controller, case.target), case.args, case.kwargs)
-    ]
+if __name__ == "__main__":
+    pytest.main(args=sys.argv)
