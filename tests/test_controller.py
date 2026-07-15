@@ -1,7 +1,11 @@
+import threading
 import tempfile
 from collections import defaultdict
 
-from declib.artifacts import Comment, Function
+import networkx as nx
+import pytest
+
+from declib.artifacts import Comment, Function, GlobalVariable, Segment, Struct
 
 from binsync.controller import BSController
 from binsync.core.client import Client
@@ -56,7 +60,7 @@ class FailingCallgraphDecompilerInterface(FakeDecompilerInterface):
         raise AttributeError("'int' object has no attribute 'function'")
 
 
-class CodeXrefDecompilerInterface(FakeDecompilerInterface):
+class PairedFunctionDecompilerInterface(FakeDecompilerInterface):
     def __init__(self):
         super().__init__()
         self.functions = {
@@ -64,59 +68,122 @@ class CodeXrefDecompilerInterface(FakeDecompilerInterface):
             0x400200: Function(addr=0x400200, size=0x20, name="callee"),
         }
 
+
+class BackendCallgraphDecompilerInterface(PairedFunctionDecompilerInterface):
+    def get_callgraph(self):
+        graph = nx.DiGraph()
+        graph.add_edge(self.functions[0x400100], self.functions[0x400200])
+        return graph
+
+
+class CodeXrefDecompilerInterface(PairedFunctionDecompilerInterface):
     def xrefs_to(self, artifact, decompile=False, only_code=False):
         if artifact.addr == 0x400200 and only_code:
             return [self.functions[0x400100]]
         return []
 
 
-def test_force_push_functions_immediately_commits_to_git():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        client = Client("user0", tmpdir, "fake_hash", init_repo=True)
-        try:
-            controller = BSController(decompiler_interface=FakeDecompilerInterface(), headless=True)
-            controller.client = client
-
-            controller.force_push_functions([0x400100])
-
-            persisted_state = client.get_state(user="user0", fetch_cache=False)
-            assert persisted_state.functions[0x400100].name == "renamed_func"
-        finally:
-            client.shutdown()
-
-
-def test_progress_callgraph_falls_back_to_decompiler_functions_when_backend_callgraph_fails():
-    controller = BSController(decompiler_interface=FailingCallgraphDecompilerInterface(), headless=True)
-
-    graph = controller.get_progress_callgraph()
-
-    assert {func.addr for func in graph.nodes} == {0x400100}
-
-
-def test_progress_callgraph_collects_code_xref_edges_without_backend_callgraph():
-    controller = BSController(decompiler_interface=CodeXrefDecompilerInterface(), headless=True)
-
-    graph = controller.get_progress_callgraph()
-
-    assert (controller.deci.functions[0x400100], controller.deci.functions[0x400200]) in graph.edges
-
-
-def test_force_push_functions_persists_raw_string_comments():
+@pytest.mark.parametrize(
+    ("artifact", "collection_name", "force_push_method", "identifier"),
+    [
+        (
+            Function(addr=0x400100, size=0x20, name="renamed_func"),
+            "functions",
+            "force_push_functions",
+            0x400100,
+        ),
+        (
+            GlobalVariable(addr=0x500000, name="global_counter", type_="int", size=4),
+            "global_vars",
+            "force_push_global_vars",
+            0x500000,
+        ),
+        (Struct(name="Record", size=8, members={}), "structs", "force_push_types", "Record"),
+        (
+            Segment(name=".text", start_addr=0x400000, end_addr=0x401000, permissions="r-x"),
+            "segments",
+            "force_push_segments",
+            ".text",
+        ),
+    ],
+    ids=("function", "global-variable", "struct", "segment"),
+)
+def test_force_push_immediately_persists_artifact(
+    artifact, collection_name, force_push_method, identifier
+):
     with tempfile.TemporaryDirectory() as tmpdir:
         client = Client("user0", tmpdir, "fake_hash", init_repo=True)
         try:
             deci = FakeDecompilerInterface()
-            deci.comments[0x400108] = "raw ghidra comment"
+            getattr(deci, collection_name)[identifier] = artifact
+
+            controller = BSController(decompiler_interface=deci, headless=True)
+            controller.client = client
+
+            getattr(controller, force_push_method)([identifier])
+
+            persisted_state = client.get_state(user="user0", fetch_cache=False)
+            assert getattr(persisted_state, collection_name)[identifier] == artifact
+        finally:
+            client.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("comment_addr", "decompiler_comment", "expected_comment"),
+    [
+        (0x400108, "raw ghidra comment", "raw ghidra comment"),
+        (
+            0x400110,
+            Comment(addr=0x400110, comment="comment artifact"),
+            "comment artifact",
+        ),
+        (0x400130, "outside function", None),
+    ],
+    ids=("raw-string", "comment-artifact", "outside-function"),
+)
+def test_force_push_function_collects_only_in_range_comments(
+    comment_addr, decompiler_comment, expected_comment
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        client = Client("user0", tmpdir, "fake_hash", init_repo=True)
+        try:
+            deci = FakeDecompilerInterface()
+            deci.comments[comment_addr] = decompiler_comment
             controller = BSController(decompiler_interface=deci, headless=True)
             controller.client = client
 
             controller.force_push_functions([0x400100])
 
             persisted_state = client.get_state(user="user0", fetch_cache=False)
-            assert persisted_state.comments[0x400108].comment == "raw ghidra comment"
-            assert persisted_state.comments[0x400108].func_addr == 0x400100
+            if expected_comment is None:
+                assert comment_addr not in persisted_state.comments
+            else:
+                assert persisted_state.comments[comment_addr].comment == expected_comment
+                assert persisted_state.comments[comment_addr].func_addr == 0x400100
         finally:
             client.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("decompiler_interface_cls", "expected_nodes", "expected_edges"),
+    [
+        (BackendCallgraphDecompilerInterface, {0x400100, 0x400200}, {(0x400100, 0x400200)}),
+        (FailingCallgraphDecompilerInterface, {0x400100}, set()),
+        (CodeXrefDecompilerInterface, {0x400100, 0x400200}, {(0x400100, 0x400200)}),
+    ],
+    ids=("backend-callgraph-edge", "backend-callgraph-failure", "code-xref-edge"),
+)
+def test_progress_callgraph_collects_backend_and_fallback_paths(
+    decompiler_interface_cls, expected_nodes, expected_edges
+):
+    controller = BSController(decompiler_interface=decompiler_interface_cls(), headless=True)
+
+    graph = controller.get_progress_callgraph()
+
+    assert {func.addr for func in graph.nodes} == expected_nodes
+    assert {(src.addr, dst.addr) for src, dst in graph.edges} == expected_edges
+    for src_addr, dst_addr in expected_edges:
+        assert (controller.deci.functions[src_addr], controller.deci.functions[dst_addr]) in graph.edges
 
 
 def test_fill_function_continues_to_address_keyed_comments_when_function_set_noops():
@@ -140,14 +207,24 @@ def test_fill_function_continues_to_address_keyed_comments_when_function_set_noo
             client.shutdown()
 
 
-def test_schedule_job_runs_manual_work_when_auto_commit_is_disabled():
+@pytest.mark.parametrize(
+    ("blocking", "expected_result"),
+    [(True, "manual sync ran"), (False, None)],
+    ids=("blocking", "nonblocking"),
+)
+def test_schedule_job_runs_manual_work_when_auto_commit_is_disabled(blocking, expected_result):
     controller = BSController(decompiler_interface=FakeDecompilerInterface(), headless=True)
     controller._auto_commit_enabled = False
     controller.push_job_scheduler.start_worker_thread()
+    job_ran = threading.Event()
+
+    def manual_sync():
+        job_ran.set()
+        return "manual sync ran"
 
     try:
-        result = controller.schedule_job(lambda: "manual sync ran", blocking=True)
+        result = controller.schedule_job(manual_sync, blocking=blocking)
+        assert job_ran.wait(timeout=2)
+        assert result == expected_result
     finally:
         controller.push_job_scheduler.stop_worker_thread()
-
-    assert result == "manual sync ran"

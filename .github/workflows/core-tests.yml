@@ -30,4 +30,4 @@ jobs:
         pip install .
     - name: Pytest
       run: |
-        pytest ./tests/test_client.py ./tests/test_state.py
+        pytest ./tests/test_client.py ./tests/test_state.py ./tests/test_controller.py
