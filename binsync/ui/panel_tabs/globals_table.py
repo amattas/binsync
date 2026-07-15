@@ -152,8 +152,8 @@ class GlobalsTableView(BinsyncTableView):
                 menu.popup(self.mapToGlobal(event.pos()))
                 return
 
-            filler_func = lambda username: lambda chk=False: self.controller.fill_artifact(
-                gvar_addr, artifact_type=GlobalVariable, user=username
+            filler_func = lambda username: lambda checked=False, addr=gvar_addr, name=username: self.controller.schedule_job(
+                self.controller.fill_artifact, addr, artifact_type=GlobalVariable, user=name
             )
 
             menu.addSeparator()

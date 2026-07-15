@@ -126,7 +126,9 @@ class QCTXTable(BinsyncTableView):
             menu.addSeparator()
             sync_action = QAction("Sync", parent=menu)
             sync_action.triggered.connect(
-                lambda: self.controller.fill_artifact(self.model.saved_ctx, artifact_type=Function, user=user_name)
+                lambda checked=False, addr=self.model.saved_ctx, name=user_name: self.controller.schedule_job(
+                    self.controller.fill_artifact, addr, artifact_type=Function, user=name
+                )
             )
             menu.addAction(sync_action)
             sync_action.hovered.connect(

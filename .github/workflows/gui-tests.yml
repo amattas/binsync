@@ -25,4 +25,4 @@ jobs:
 
     - name: Pytest
       run: |
-        QT_QPA_PLATFORM="offscreen" pytest ./tests/test_auxiliary_server.py -s #./tests/test_angr_gui.py
+        QT_QPA_PLATFORM="offscreen" pytest ./tests/test_auxiliary_server.py ./tests/test_binja.py ./tests/test_ghidra.py ./tests/test_ui_panels.py -s #./tests/test_angr_gui.py

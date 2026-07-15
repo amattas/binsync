@@ -94,6 +94,16 @@ class ControlPanel(QWidget):
 
     def closeEvent(self, event):
         if self.controller is not None:
+            utilities_panel = getattr(self, "_utilities_panel", None)
+            if utilities_panel is not None:
+                utilities_panel.shutdown()
+
+            if self.controller.ui_callback == self.update_callback:
+                self.controller.ui_callback = None
+
+            if self.controller.ctx_change_callback == self.ctx_callback:
+                self.controller.ctx_change_callback = None
+
             self.controller.client_init_callback = None
 
     @staticmethod

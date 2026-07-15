@@ -277,9 +277,6 @@ class BSController:
             self._ui_updater_thread.wait(2000)
 
     def schedule_job(self, cmd_func, *args, blocking=False, **kwargs):
-        if not self._auto_commit_enabled:
-            return None
-
         if blocking:
             return self.push_job_scheduler.schedule_and_wait_job(
                 Job(cmd_func, *args, **kwargs),
@@ -723,8 +720,15 @@ class BSController:
                             merged_artifact.header.args = {}
                             merged_artifact.header.type = None
 
-                # set the imports into the decompiler
-                art_dict[identifier] = merged_artifact
+                # set the imports into the decompiler. NOTE: a no-op set (e.g. the
+                # function already has this name/header in the decompiler) makes the
+                # underlying set_artifact return False, which the remote client turns
+                # into a "Failed to set artifact" exception. That must not abort the
+                # address-keyed comment sync below, so isolate the function set.
+                try:
+                    art_dict[identifier] = merged_artifact
+                except Exception as e:
+                    _l.warning("Setting %s into the decompiler made no change or failed: %s", merged_artifact, e)
 
                 # TODO: figure out a way to do this inside DecLib (getting all comments for a func)
                 if artifact_type is Function:
@@ -1124,13 +1128,17 @@ class BSController:
     # Force Push
     #
 
+    def _flush_force_push_state(self):
+        self.client.commit_and_update_states()
+
     @init_checker
     def force_push_functions(self, func_addrs: List[int], use_decompilation=False):
         """
         Collects the functions currently stored in the decompiler, not the BS State, and commits it to
-        the master users BS Database. Function addrs should be in the lifted form.
+        the master users BS Database. Function addrs should be in the lifted form. Comments that fall
+        within each pushed function are collected from the decompiler and committed as well.
 
-        TODO: push the comments and custom types that are associated with each stack vars
+        TODO: push the custom types that are associated with each stack var
         TODO: refactor to use internal push_function for correct commit message
         """
 
@@ -1164,10 +1172,60 @@ class BSController:
             master_state.set_function(func)
         committed += len(funcs)
 
+        # also force push the comments contained within each pushed function. comments are a
+        # separate, address-keyed artifact rather than fields on the Function, so they are not
+        # carried by set_function and must be collected and committed explicitly.
+        cmt_committed = self._force_push_function_comments(master_state, funcs)
+
         # commit the master state back!
-        master_state.last_commit_msg = f"Force pushed {committed} functions"
+        cmt_suffix = f" and {cmt_committed} comment{'' if cmt_committed == 1 else 's'}" if cmt_committed else ""
+        master_state.last_commit_msg = f"Force pushed {committed} functions{cmt_suffix}"
         self.client.master_state = master_state
-        self.deci.info(f"Functions force push successful: committed {committed} function{'' if committed == 1 else 's'}.")
+        self._flush_force_push_state()
+        self.deci.info(
+            f"Functions force push successful: committed {committed} function{'' if committed == 1 else 's'}"
+            f"{cmt_suffix}."
+        )
+
+    def _force_push_function_comments(self, master_state: State, funcs: List[Function]) -> int:
+        """
+        Collects every comment currently set in the decompiler that falls within one of the given
+        functions and commits it into ``master_state``. The decompiler is scanned exactly once
+        regardless of how many functions are pushed. Comments are attributed to a function by
+        address range, matching ``State.get_func_comments``, so this works against any declib that
+        exposes ``deci.comments`` (it does not rely on the comment's ``func_addr`` being populated).
+        Returns the number of comments committed.
+        """
+        try:
+            decompiler_comments = dict(self.deci.comments.items())
+        except Exception as e:
+            _l.warning("Failed to collect decompiler comments for force push: %s", e)
+            return 0
+
+        if not decompiler_comments:
+            return 0
+
+        committed = 0
+        for func in funcs:
+            func_size = func.size or self.deci.get_func_size(func.addr) or 0
+            func_end = func.addr + func_size
+            for addr, cmt in decompiler_comments.items():
+                # libbs may hand back either a Comment artifact or a raw comment
+                # string depending on how the comment was set in the decompiler
+                # (e.g. programmatic/MCP edits arrive as plain strings); normalize
+                # to a Comment so the attribute access below is always valid.
+                if isinstance(cmt, str):
+                    cmt = Comment(addr=addr, comment=cmt)
+                if cmt is None or not cmt.comment:
+                    continue
+                if not (func.addr <= addr <= func_end):
+                    continue
+
+                cmt.func_addr = func.addr
+                if master_state.set_comment(cmt):
+                    committed += 1
+
+        return committed
 
     @init_checker
     def force_push_global_vars(self, addrs: List[int]):
@@ -1191,6 +1249,7 @@ class BSController:
 
         master_state.last_commit_msg = f"Force pushed {committed} global{'' if committed == 1 else 's'}"
         self.client.master_state = master_state
+        self._flush_force_push_state()
         self.deci.info(f"Globals force push successful: committed {committed} global{'' if committed == 1 else 's'}.")
 
     @init_checker
@@ -1218,6 +1277,7 @@ class BSController:
 
         master_state.last_commit_msg = f"Force pushed {committed} type{'' if committed == 1 else 's'}"
         self.client.master_state = master_state
+        self._flush_force_push_state()
         self.deci.info(f"Types force push successful: committed {committed} type{'' if committed == 1 else 's'}.")
 
     @init_checker
@@ -1249,6 +1309,7 @@ class BSController:
 
         master_state.last_commit_msg = f"Force pushed {committed} segments"
         self.client.master_state = master_state
+        self._flush_force_push_state()
         self.deci.info(f"Segments force push successful: committed {committed} segment{'' if committed == 1 else 's'}.")
 
     #
@@ -1549,6 +1610,50 @@ class BSController:
 
         return function_counts
 
+    def get_progress_callgraph(self):
+        import networkx as nx
+
+        fallback_to_xrefs = False
+        try:
+            graph = self.deci.get_callgraph()
+        except Exception as e:
+            _l.warning("Failed to collect decompiler callgraph for progress view: %s", e)
+            graph = nx.DiGraph()
+            fallback_to_xrefs = True
+            try:
+                self.deci.warning("Callgraph collection failed; rebuilding progress graph from code xrefs.")
+            except Exception:
+                pass
+        else:
+            graph = graph.copy() if graph is not None else nx.DiGraph()
+
+        funcs_by_addr = {
+            func.addr: func for func in self.deci.functions.values()
+            if getattr(func, "addr", None) is not None
+        }
+
+        # Some backend callgraph APIs only add functions that participate in an edge.
+        # The progress view still needs isolated and changed functions as nodes.
+        for func in funcs_by_addr.values():
+            graph.add_node(func)
+
+        if fallback_to_xrefs and hasattr(self.deci, "xrefs_to"):
+            for target_func in funcs_by_addr.values():
+                try:
+                    callers = self.deci.xrefs_to(target_func, only_code=True)
+                except Exception as e:
+                    _l.debug("Failed to collect code xrefs to %s for progress view: %s", target_func, e)
+                    continue
+
+                for caller in callers:
+                    if not isinstance(caller, Function):
+                        continue
+
+                    caller_func = funcs_by_addr.get(caller.addr, caller)
+                    graph.add_edge(caller_func, target_func)
+
+        return graph
+
     def show_progress_window(self, *args, tag=None, **kwargs):
         """
         TODO: re-enable this later when you figure out how fix the apparent thread/proccess issue in IDA Pro
@@ -1562,7 +1667,7 @@ class BSController:
         #    return
 
         self.deci.info("Collecting data to make progress view now...")
-        graph = self.deci.get_callgraph()
+        graph = self.get_progress_callgraph()
         if tag == "master":
             tag = None
 
